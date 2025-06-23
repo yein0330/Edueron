@@ -1,0 +1,68 @@
+[
+  {
+    "title": "Page 1",
+    "start_page": 1,
+    "end_page": 1,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 2",
+    "start_page": 2,
+    "end_page": 2,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 3",
+    "start_page": 3,
+    "end_page": 3,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 4",
+    "start_page": 4,
+    "end_page": 4,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 5",
+    "start_page": 5,
+    "end_page": 5,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 6",
+    "start_page": 6,
+    "end_page": 6,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 7",
+    "start_page": 7,
+    "end_page": 7,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 8",
+    "start_page": 8,
+    "end_page": 8,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 9",
+    "start_page": 9,
+    "end_page": 9,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 10",
+    "start_page": 10,
+    "end_page": 10,
+    "method": "Page-based"
+  },
+  {
+    "title": "Page 11",
+    "start_page": 11,
+    "end_page": 11,
+    "method": "Page-based"
+  }
+]

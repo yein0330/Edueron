@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": ["./src"],
+    "python.defaultInterpreterPath": "python3",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true
+  }
