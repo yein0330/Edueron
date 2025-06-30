@@ -1,0 +1,207 @@
+# scripts/pdf_extractor.py
+
+import os
+import json
+import sys
+import fitz  # PyMuPDF
+from typing import Dict, Any, List, Tuple
+import pdfplumber
+import io
+import pytesseract
+from pytesseract import image_to_string
+from PIL import Image
+import pandas as pd
+import numpy as np
+import cv2
+from sklearn.cluster import KMeans
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+# pdfplumber re‑raises most parsing issues as pdfminer.six exceptions
+from pdfminer.pdfparser import PDFSyntaxError
+import logging
+import re
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+# OCR and multi‑column handling helpers
+# ──────────────────────────────────────────────
+def ocr_page_words(page, dpi: int = 600, lang: str = "eng+kor") -> pd.DataFrame:
+    """
+    OCR로 페이지 이미지를 처리하여 단어 단위의 박스(x0, y0, x1, y1, text)를 DataFrame 형태로 반환
+    """
+    zoom = dpi / 72
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+
+    # Tesseract OCR 실행 - kor+eng, oem=3(LSTM), psm=6(auto full page)
+    custom_config = "--oem 3 --psm 6"
+
+    # 이미지 전처리: 회색조 변환 후 Otsu 이진화
+    img_np = np.array(img)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    img = Image.fromarray(thresh)
+
+    df = pytesseract.image_to_data(
+        img,
+        lang=lang,
+        config = custom_config,
+        output_type=pytesseract.Output.DATAFRAME
+    )
+
+    df = df[(df.conf != -1) & df.text.notnull()].copy()
+    df.rename(columns={"left": "x0", "top": "y0"}, inplace=True)
+    df["x1"] = df.x0 + df.width
+    df["y1"] = df.y0 + df.height
+    return df[["x0", "y0", "x1", "y1", "text"]]
+
+def is_multicol(df: pd.DataFrame, page_width: float, gap_ratio_thr: float = 0.06) -> bool:
+    """
+    텍스트가 멀티컬럼으로 배치되어 있는지 여부를 판단
+    """
+    if len(df) < 30:
+        return False
+    centers = ((df.x0 + df.x1) / 2).to_numpy()
+    centers.sort()
+    gaps = np.diff(centers)
+    return (gaps.max() / page_width) > gap_ratio_thr
+
+def assign_columns_kmeans(df: pd.DataFrame, max_cols: int = 3) -> pd.DataFrame:
+    """
+    단어 중심 좌표를 기반으로 KMeans 클러스터링하여 컬럼 번호를 부여
+    """
+    k = 2 #min(max_cols, len(df))
+    km = KMeans(n_clusters=k, n_init="auto").fit(
+        ((df.x0 + df.x1) / 2).to_numpy().reshape(-1, 1)
+    )
+    df["col"] = km.labels_
+    order = df.groupby("col").x0.min().sort_values().index.tolist()
+    df["col"] = df.col.map({old: new for new, old in enumerate(order)})
+    return df
+
+def rebuild_text_from_columns(df: pd.DataFrame, line_tol: int = 8, preserve_linebreaks: bool = True) -> str:
+    """
+    컬럼과 라인 순서를 고려하여 전체 텍스트를 재구성
+    """
+    lines = []
+    for col in sorted(df.col.unique()):
+        col_df = df[df.col == col].sort_values(["y0", "x0"])
+        current, last_top = [], None
+        for _, w in col_df.iterrows():
+            if last_top is None or abs(w.y0 - last_top) <= line_tol:
+                current.append(w.text)
+            else:
+                lines.append(" ".join(current))
+                current = [w.text]
+            last_top = w.y0
+        if current:
+            lines.append(" ".join(current))
+    return "\n".join(lines) if preserve_linebreaks else " ".join(lines)
+
+def process_single_page(page_info: Tuple[int, any], ocr_lang: str = "eng+kor", ocr_dpi: int = 600) -> Tuple[int, str]:
+    """
+    페이지 인덱스와 페이지 객체를 받아 OCR로 텍스트 추출 후 재구성하여 반환
+    첫 페이지의 경우, 상단 15% 영역 제거
+    """
+    page_idx, page = page_info
+    words_df = ocr_page_words(page, dpi=ocr_dpi, lang=ocr_lang)
+
+    # 첫 페이지인 경우 상단 15% 제거
+    if page_idx == 0:
+        height = page.rect.height
+        words_df = words_df[words_df.y0 > height * 0.15]
+
+    if is_multicol(words_df, page.rect.width):
+        words_df = assign_columns_kmeans(words_df)
+        page_text = rebuild_text_from_columns(words_df, preserve_linebreaks=True)
+    else:
+        page_text = " ".join(words_df.sort_values(["y0", "x0"]).text)
+
+    return page_idx, page_text
+
+# ────────────────────────────────────────────────────────────────
+# Main extraction function with exam mode support
+# ────────────────────────────────────────────────────────────────
+def extract_exam_pdf_and_save(pdf_path: str, output_path: str, lang: str = "eng+kor", dpi: int = 600, max_workers: int = 4) -> Dict[int, str]:
+    """
+    시험지 PDF를 OCR 기반으로 추출한 후, 각 페이지별 텍스트를 JSON 파일로 저장.
+    
+    Args:
+        pdf_path (str): 입력 PDF 경로
+        output_path (str): 저장할 JSON 파일 경로
+        lang (str): OCR 언어 설정 (기본: 'eng')
+        dpi (int): OCR 해상도 (기본: 350)
+        max_workers (int): 병렬 처리 쓰레드 수
+
+    Returns:
+        Dict[int, str]: 페이지 번호 → 텍스트 내용 매핑
+    """
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    page_data = [(i, doc[i]) for i in range(total_pages)]
+    pages_text = [None] * total_pages
+
+    process_func = partial(process_single_page, ocr_lang=lang, ocr_dpi=dpi)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_page = {executor.submit(process_func, p): p[0] for p in page_data}
+        for future in as_completed(future_to_page):
+            try:
+                idx, text = future.result()
+                pages_text[idx] = text
+            except Exception as e:
+                print(f"[ERROR] Failed to process page {future_to_page[future] + 1}: {e}")
+                pages_text[future_to_page[future]] = ""
+
+    # 딕셔너리 형태로 변환 (1-based index)
+    result_dict = {i + 1: text for i, text in enumerate(pages_text)}
+
+    # 저장
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(result_dict, f, ensure_ascii=False, indent=2)
+
+    print(f"[INFO] Extracted text saved to '{output_path}'")
+    return result_dict
+
+
+def save_extracted_content(content: Dict[str, Any], output_path: str):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(content, f, ensure_ascii=False, indent=2)
+
+if __name__ == "__main__":
+    pdf_folder = os.path.join("data", "original")
+    output_folder = os.path.join("data", "extracted")
+    os.makedirs(output_folder, exist_ok=True)
+
+    pdf_files = [f for f in os.listdir(pdf_folder) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        print(f"[ERROR] No PDF files found in '{pdf_folder}'.")
+        sys.exit(1)
+
+    if len(pdf_files) > 1:
+        print("Multiple PDF files found:")
+        for idx, fname in enumerate(pdf_files):
+            print(f"{idx+1}. {fname}")
+        selection = input("Select a file by number: ")
+        try:
+            selection_idx = int(selection) - 1
+            if selection_idx < 0 or selection_idx >= len(pdf_files):
+                print("Invalid selection.")
+                sys.exit(1)
+            selected_file = pdf_files[selection_idx]
+        except ValueError:
+            print("Invalid input.")
+            sys.exit(1)
+    else:
+        selected_file = pdf_files[0]
+
+    pdf_path = os.path.join(pdf_folder, selected_file)
+    base_name = os.path.splitext(selected_file)[0]
+    output_path = os.path.join(output_folder, f"{base_name}.json")
+
+    print(f"Processing file: {selected_file}")
+    extracted_data = extract_exam_pdf_and_save(pdf_path, output_path)
